@@ -31,25 +31,21 @@ type Config struct {
 	StartHeight      *big.Int
 	Confirmations    uint64
 }
-
-type BaseSynchronizer struct {
-	loopInterval     time.Duration
-	headerBufferSize uint64
-
-	businessChannels chan map[string]*TransactionsChannel
-
-	rpcClient  *rpcclient.WalletChainAccountClient
-	blockBatch *rpcclient.BatchBlock
-	database   *database.DB
-
-	headers []rpcclient.BlockHeader
-	worker  *clock.LoopFn
-}
-
 type TransactionsChannel struct {
 	BlockHeight  uint64
 	ChannelId    string
 	Transactions []*Transaction
+}
+type BaseSynchronizer struct {
+	loopInterval     time.Duration
+	headerBufferSize uint64
+	businessChannels chan map[string]*TransactionsChannel
+	rpcClient        *rpcclient.WalletChainAccountClient
+	blockBatch       *rpcclient.BatchBlock
+	database         *database.DB
+
+	headers []rpcclient.BlockHeader
+	worker  *clock.LoopFn
 }
 
 func (syncer *BaseSynchronizer) Start() error {
@@ -63,7 +59,6 @@ func (syncer *BaseSynchronizer) Start() error {
 	}, syncer.loopInterval)
 	return nil
 }
-
 func (syncer *BaseSynchronizer) Close() error {
 	if syncer.worker == nil {
 		return nil
@@ -72,6 +67,7 @@ func (syncer *BaseSynchronizer) Close() error {
 }
 
 func (syncer *BaseSynchronizer) tick(_ context.Context) {
+	//如何缓冲里面还有的话就继续处理
 	if len(syncer.headers) > 0 {
 		log.Info("retrying previous batch")
 	} else {
@@ -96,36 +92,37 @@ func (syncer *BaseSynchronizer) processBatch(headers []rpcclient.BlockHeader) er
 	}
 	businessTxChannel := make(map[string]*TransactionsChannel)
 	blockHeaders := make([]database.Blocks, len(headers))
-
 	for i := range headers {
 		log.Info("Sync block data", "height", headers[i].Number)
 		blockHeaders[i] = database.Blocks{Hash: headers[i].Hash, ParentHash: headers[i].ParentHash, Number: headers[i].Number, Timestamp: headers[i].Timestamp}
+		//	获取区块中的交易信息
 		txList, err := syncer.rpcClient.GetBlockInfo(headers[i].Number)
 		if err != nil {
 			log.Error("get block info fail", "err", err)
 			return err
 		}
-
+		//查出所有business表中的信息
 		businessList, err := syncer.database.Business.QueryBusinessList()
 		if err != nil {
 			log.Error("query business list fail", "err", err)
 			return err
 		}
 
-		for _, businessId := range businessList {
+		for _, business := range businessList {
 			var businessTransactions []*Transaction
 			for _, tx := range txList {
 				toAddress := common.HexToAddress(tx.To)
 				fromAddress := common.HexToAddress(tx.From)
-				existToAddress, toAddressType := syncer.database.Addresses.AddressExist(businessId.BusinessUid, &toAddress)
-				existFromAddress, FromAddressType := syncer.database.Addresses.AddressExist(businessId.BusinessUid, &fromAddress)
+				//查询对应的business分表，看是否存在
+				existToAddress, toAddressType := syncer.database.Addresses.AddressExist(business.BusinessUid, &toAddress)
+				existFromAddress, FromAddressType := syncer.database.Addresses.AddressExist(business.BusinessUid, &fromAddress)
+				//都不存在直接跳过
 				if !existToAddress && !existFromAddress {
 					continue
 				}
-
 				log.Info("Found transaction", "txHash", tx.Hash, "from", fromAddress, "to", toAddress)
 				txItem := &Transaction{
-					BusinessId:     businessId.BusinessUid,
+					BusinessId:     business.BusinessUid,
 					BlockNumber:    headers[i].Number,
 					FromAddress:    tx.From,
 					ToAddress:      tx.To,
@@ -134,7 +131,6 @@ func (syncer *BaseSynchronizer) processBatch(headers []rpcclient.BlockHeader) er
 					ContractWallet: tx.ContractWallet,
 					TxType:         database.TxTypeUnKnow,
 				}
-
 				/*
 				 * If the 'from' address is an external address and the 'to' address is an internal user address, it is a deposit; call the callback interface to notifier the business side.
 				 * If the 'from' address is a user address and the 'to' address is a hot wallet address, it is consolidation; call the callback interface to notifier the business side.
@@ -162,26 +158,28 @@ func (syncer *BaseSynchronizer) processBatch(headers []rpcclient.BlockHeader) er
 					txItem.TxType = database.TxTypeHot2Cold
 				}
 
-				if (existFromAddress && FromAddressType == database.AddressTypeCold) && (existToAddress && toAddressType == database.AddressTypeHot) { // 热转冷
+				if (existFromAddress && FromAddressType == database.AddressTypeCold) && (existToAddress && toAddressType == database.AddressTypeHot) { // 冷转热
 					log.Info("Found cold2hot transaction", "txHash", tx.Hash, "from", fromAddress, "to", toAddress)
 					txItem.TxType = database.TxTypeCold2Hot
 				}
 				businessTransactions = append(businessTransactions, txItem)
+
 			}
 			if len(businessTransactions) > 0 {
-				if businessTxChannel[businessId.BusinessUid] == nil {
-					businessTxChannel[businessId.BusinessUid] = &TransactionsChannel{
+				if businessTxChannel[business.BusinessUid] == nil {
+					businessTxChannel[business.BusinessUid] = &TransactionsChannel{
 						BlockHeight:  headers[i].Number.Uint64(),
 						Transactions: businessTransactions,
 					}
 				} else {
-					businessTxChannel[businessId.BusinessUid].BlockHeight = headers[i].Number.Uint64()
-					businessTxChannel[businessId.BusinessUid].Transactions = append(businessTxChannel[businessId.BusinessUid].Transactions, businessTransactions...)
+					//设置最新的高度
+					businessTxChannel[business.BusinessUid].BlockHeight = headers[i].Number.Uint64()
+					businessTxChannel[business.BusinessUid].Transactions = append(businessTxChannel[business.BusinessUid].Transactions, businessTransactions...)
 				}
 			}
 		}
 	}
-
+	//存在的交易的block就入库保存
 	if len(blockHeaders) > 0 {
 		log.Info("Store block headers success", "totalBlockHeader", len(blockHeaders))
 		if err := syncer.database.Blocks.StoreBlockss(blockHeaders); err != nil {
@@ -190,6 +188,7 @@ func (syncer *BaseSynchronizer) processBatch(headers []rpcclient.BlockHeader) er
 	}
 	log.Info("business tx channel", "businessTxChannel", businessTxChannel, "map length", len(businessTxChannel))
 	if len(businessTxChannel) > 0 {
+		//通道通知
 		syncer.businessChannels <- businessTxChannel
 	}
 
