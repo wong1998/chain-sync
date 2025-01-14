@@ -52,6 +52,7 @@ func (w *Internal) Close() error {
 	return nil
 }
 
+// 定时找到创建签名但是没有发出的进行发送交易
 func (w *Internal) Start() error {
 	log.Info("start internals......")
 	w.tasks.Go(func() error {
